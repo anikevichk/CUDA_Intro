@@ -3,6 +3,9 @@
 #include <cstdlib>
 #include <cmath>
 
+constexpr int TILE_SIZE = 16;
+constexpr int N = 1024;
+
 __global__ void mm(float* A, float* B, float* C, int N) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -16,6 +19,34 @@ __global__ void mm(float* A, float* B, float* C, int N) {
 
         C[row * N + col] = sum;
     }
+}
+
+__global__ void mm_tiled(float* A, float* B, float* C, int N) {
+    __shared__ float sA[TILE_SIZE][TILE_SIZE];
+    __shared__ float sB[TILE_SIZE][TILE_SIZE];
+
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+
+    float sum = 0.0f;
+
+    for (int t = 0; t < (N + TILE_SIZE - 1) / TILE_SIZE; t++) {
+        int tiledCol = t * TILE_SIZE + threadIdx.x;
+        int tiledRow = t * TILE_SIZE + threadIdx.y;
+
+        sA[threadIdx.y][threadIdx.x] = A[row * N + tiledCol];
+        sB[threadIdx.y][threadIdx.x] = B[tiledRow * N + col];
+
+        __syncthreads();
+
+        for (int k = 0; k < TILE_SIZE; k++) {
+            sum += sA[threadIdx.y][k] * sB[k][threadIdx.x];
+        }
+
+        __syncthreads();
+    }
+
+    C[row * N + col] = sum;
 }
 
 void cpu_mm(float* A, float* B, float* C, int N) {
@@ -33,7 +64,6 @@ void cpu_mm(float* A, float* B, float* C, int N) {
 }
 
 int main() {
-    const int N = 512;
     size_t bytes = N * N * sizeof(float);
 
     float* h_A = new float[N * N];
@@ -61,15 +91,13 @@ int main() {
     cudaMemcpy(d_A, h_A, bytes, cudaMemcpyHostToDevice);
     cudaMemcpy(d_B, h_B, bytes, cudaMemcpyHostToDevice);
 
-    int blockSize = 16;
-
-    dim3 numThreads(blockSize, blockSize);
+    dim3 numThreads(TILE_SIZE, TILE_SIZE);
     dim3 numBlocks(
-        (N + blockSize - 1) / blockSize,
-        (N + blockSize - 1) / blockSize
+        (N + TILE_SIZE - 1) / TILE_SIZE,
+        (N + TILE_SIZE - 1) / TILE_SIZE
     );
 
-    mm << <numBlocks, numThreads >> > (d_A, d_B, d_C, N);
+    mm_tiled << <numBlocks, numThreads >> > (d_A, d_B, d_C, N);
     cudaDeviceSynchronize();
 
     cudaMemcpy(h_C_GPU, d_C, bytes, cudaMemcpyDeviceToHost);
@@ -78,15 +106,11 @@ int main() {
     const float eps = 1e-3f;
 
     for (int i = 0; i < N * N; i++) {
-        if (std::fabs(h_C_GPU[i] - h_C[i]) > eps) {
-            errors++;
-        }
+        if (std::fabs(h_C_GPU[i] - h_C[i]) > eps) errors++;
     }
 
-    if (errors == 0)
-        std::cout << "everything is ok\n";
-    else
-        std::cout << "wrong results, errors: " << errors << "\n";
+    if (errors == 0) std::cout << "everything is ok\n";
+    else             std::cout << "wrong results, errors: " << errors << "\n";
 
     cudaFree(d_A);
     cudaFree(d_B);
