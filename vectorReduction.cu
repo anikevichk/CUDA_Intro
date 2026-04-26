@@ -1,20 +1,44 @@
 #include <iostream>
+#include <algorithm>
 #include <cuda_runtime.h>
 
-__global__ void reduce_in_place(float* input, int n) {
+__global__ void reduce_safe(float* input, float* output, int n) {
+    extern __shared__ float sdata[];
+
     int tid = threadIdx.x;
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int index = 2 * blockIdx.x * blockDim.x + tid;
 
-    for (int stride = 1; stride < blockDim.x; stride *= 2) {
-        __syncthreads();
+    float sum = 0.0f;
 
-        if (tid % (2 * stride) == 0 && index + stride < n) {
-            input[index] += input[index + stride];
+    if (index < n) {
+        sum += input[index];
+    }
+
+    if (index + blockDim.x < n) {
+        sum += input[index + blockDim.x];
+    }
+
+    sdata[tid] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 32; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] += sdata[tid + stride];
         }
+        __syncthreads();
+    }
+
+    if (tid < 32) {
+        sdata[tid] += sdata[tid + 32];
+        sdata[tid] += sdata[tid + 16];
+        sdata[tid] += sdata[tid + 8];
+        sdata[tid] += sdata[tid + 4];
+        sdata[tid] += sdata[tid + 2];
+        sdata[tid] += sdata[tid + 1];
     }
 
     if (tid == 0) {
-        input[blockIdx.x] = input[blockIdx.x * blockDim.x];
+        output[blockIdx.x] = sdata[0];
     }
 }
 
@@ -33,16 +57,20 @@ int main() {
     size_t bytes = n * sizeof(float);
 
     float* h_input = new float[n];
-    float* d_input;
 
     for (int i = 0; i < n; i++) {
         h_input[i] = static_cast<float>(i + 1);
     }
 
+    float* d_input;
+    float* d_output;
+
     cudaMalloc(&d_input, bytes);
+    cudaMalloc(&d_output, bytes);
+
     cudaMemcpy(d_input, h_input, bytes, cudaMemcpyHostToDevice);
 
-    int blockSize = 256;
+    int blockSize = 128;
 
     float total_sum = cpu_reduce(h_input, n);
     std::cout << "Total sum (CPU): " << total_sum << std::endl;
@@ -50,10 +78,14 @@ int main() {
     int currentSize = n;
 
     while (currentSize > 1) {
-        int gridSize = (currentSize + blockSize - 1) / blockSize;
+        int gridSize = (currentSize + blockSize * 2 - 1) / (blockSize * 2);
 
-        reduce_in_place << <gridSize, blockSize >> > (d_input, currentSize);
+        reduce_safe << <gridSize, blockSize, blockSize * sizeof(float) >> >
+            (d_input, d_output, currentSize);
+
         cudaDeviceSynchronize();
+
+        std::swap(d_input, d_output);
 
         currentSize = gridSize;
     }
@@ -63,6 +95,7 @@ int main() {
     std::cout << "Final sum (GPU): " << h_input[0] << std::endl;
 
     cudaFree(d_input);
+    cudaFree(d_output);
     delete[] h_input;
 
     return 0;
